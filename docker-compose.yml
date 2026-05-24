@@ -1,0 +1,64 @@
+# Local development stack.
+# Two containers, one network. MySQL 8 + the Node app (API + worker via concurrently).
+#
+# Boot:    docker compose up --build
+# Wipe DB: docker compose down -v
+services:
+  mysql:
+    image: mysql:8.0
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: glacis
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      # Compose waits for this to pass before starting the app. Important:
+      # the mysql:8 image runs a TEMPORARY server during DB initialization,
+      # then shuts it down and starts the real one on 3306. A unix-socket
+      # ping passes during the temp-server window, which races the app.
+      # Pinging via TCP (-h 127.0.0.1 -P 3306) only succeeds once the real
+      # server is bound to the network port.
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -P 3306 -uroot -proot --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  app:
+    build: .
+    # If MySQL is briefly unavailable on the first migration attempt (cold
+    # boot races, transient network blip), restart and try again. Combined
+    # with the healthcheck above this should be a non-event in practice.
+    restart: on-failure:5
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      PORT: "3000"
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_USER: root
+      DB_PASSWORD: root
+      DB_NAME: glacis
+      # Pulled from your shell or .env file (see .env.example).
+      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-6}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "3000:3000"
+    volumes:
+      # Bind-mount source for hot reload. The anonymous volume on node_modules
+      # prevents the host's (possibly macOS-built) node_modules from clobbering
+      # the container's Linux-built modules.
+      - .:/app
+      - /app/node_modules
+
+volumes:
+  mysql_data:
