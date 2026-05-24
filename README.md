@@ -24,6 +24,108 @@ The replay harness:
 
 ---
 
+## Sending a test webhook
+
+The endpoint accepts any well-formed JSON. Useful for poking the system from a terminal, Postman, or a vendor sandbox.
+
+**Single POST — minimum viable:**
+
+```bash
+curl -sS -X POST http://localhost:3000/webhooks \
+  -H 'content-type: application/json' \
+  -d '{
+    "carrier_scac": "MAEU",
+    "transport_doc": { "type": "MBL", "number": "MAEU240498712" },
+    "container": "MSKU7748112",
+    "milestone": "Loaded onboard and sailed",
+    "milestone_at": "2026-04-21T22:47:00+08:00"
+  }' | jq
+```
+
+Response (immediate, < 100 ms):
+
+```json
+{ "ok": true, "raw_event_id": 1 }
+```
+
+The LLM call happens asynchronously in the worker (~2–5 s later). Watch `docker compose logs -f app` to see it process, then inspect the result:
+
+```bash
+curl -sS http://localhost:3000/raw-events  | jq '.[] | {id, status, classification, attempts}'
+curl -sS http://localhost:3000/shipments   | jq
+curl -sS http://localhost:3000/invoices    | jq
+```
+
+**Tag with a vendor name** (lands in `raw_events.vendor_hint`):
+
+```bash
+curl -sS -X POST http://localhost:3000/webhooks/lastmilenow \
+  -H 'content-type: application/json' \
+  -d '{ "system": "LastMileNow API", "tracking_reference": "LMN-99999",
+        "update": { "description": "On the truck" },
+        "timestamp_utc": "2026-05-24T12:15:00Z" }'
+```
+
+**Demonstrate dedupe** (identical bodies):
+
+```bash
+PAYLOAD='{"carrier":"DHL","awb":"123-99999","milestone":"departed","event_time":"2026-05-24T10:00:00Z"}'
+
+curl -sS -X POST http://localhost:3000/webhooks \
+  -H 'content-type: application/json' -d "$PAYLOAD" | jq
+# → { "ok": true, "raw_event_id": 2 }
+
+curl -sS -X POST http://localhost:3000/webhooks \
+  -H 'content-type: application/json' -d "$PAYLOAD" | jq
+# → { "ok": true, "duplicate": true, "raw_event_id": 2, "status": "..." }
+```
+
+**Demonstrate out-of-order** (same entity, two events, "wrong" order):
+
+```bash
+# DELIVERED arrives first
+curl -sS -X POST http://localhost:3000/webhooks -H 'content-type: application/json' -d '{
+  "logistics_provider": "TestCarrier", "parcel_id": "TEST-001",
+  "scan_type": "Handed to recipient", "scan_time": "2026-05-25T14:45:00Z"
+}'
+
+sleep 5
+
+# Then PICKED_UP (chronologically earlier)
+curl -sS -X POST http://localhost:3000/webhooks -H 'content-type: application/json' -d '{
+  "logistics_provider": "TestCarrier", "parcel_id": "TEST-001",
+  "scan_type": "Collected from sender", "scan_time": "2026-05-23T10:15:00Z"
+}'
+
+sleep 5
+
+# current_state should be DELIVERED; history should have BOTH events.
+curl -sS http://localhost:3000/shipments | jq '.[] | select(.natural_key | contains("test-001"))'
+```
+
+**Unhappy paths:**
+
+```bash
+# Malformed JSON → 400 malformed_json
+curl -i -X POST http://localhost:3000/webhooks \
+  -H 'content-type: application/json' -d '{ this is not json'
+
+# Payload > 256 KiB → 413 payload_too_large
+python3 -c "import json,sys; sys.stdout.write(json.dumps({'data':'x'*300000}))" \
+  | curl -i -X POST http://localhost:3000/webhooks \
+      -H 'content-type: application/json' --data-binary @-
+```
+
+**Query MySQL directly** (for debugging):
+
+```bash
+docker compose exec mysql mysql -uroot -proot glacis -e "
+  SELECT id, status, classification, attempts, entity_type, entity_id, llm_latency_ms
+    FROM raw_events ORDER BY id DESC LIMIT 5;"
+```
+
+---
+
 ## Architecture
 
 ```
@@ -194,42 +296,42 @@ These are the calls I made knowingly and would revisit for production:
 
 ## Production roadmap
 
-In rough priority order — what I'd do next, week by week, to take this to production:
+In rough priority order — what I'd do next to take this to production:
 
-**Week 1 — Trust & safety**
+**Trust & safety**
 
 - Per-vendor HMAC/signature verification middleware, with key rotation.
 - Authentication on read APIs (mTLS or signed JWTs from the platform).
 - Rate limiting + per-vendor circuit breakers (a misbehaving vendor must not exhaust the LLM budget).
 - Secret management via Vault / SM (not `.env`).
 
-**Week 2 — Observability**
+**Observability**
 
 - Metrics: queue depth by status, claim-to-settle p50/p95, LLM latency histograms by model, classification distribution, `needs_review` rate, DLQ size, cost-per-event.
 - Tracing: OpenTelemetry spans ingest → claim → LLM → settle, tagged with `raw_event_id`. Correlate across container boundaries.
 - Alerts: `pending` depth > N for > M min, `dead` rate > X%, p95 ingest latency > 1s, MySQL connection saturation.
 - Per-vendor dashboards (classification accuracy, latency, cost).
 
-**Week 3 — Operational tooling**
+**Operational tooling**
 
 - Web UI for `needs_review`: render the raw payload + LLM output + reasoning; let an operator approve, edit, or reclassify. Operator decisions feed back into prompt refinement.
 - DLQ replay UI: select a `dead` event, optionally edit its payload, requeue.
 - "Re-normalize history" workflow: given a prompt version, re-process all `raw_events` since date X, compare results, blue/green cutover.
 
-**Week 4 — Scale & cost**
+**Scale & cost**
 
 - Move queue from MySQL to a dedicated queueing system (Redis, Kafka, etc.) when sustained throughput exceeds ~1k events/sec. Outbox pattern preserves the transactional ack semantics.
 - Two-stage LLM: Haiku for classification + identity extraction; Sonnet only for shipment/invoice extraction. Probably ~5x cheaper for the unclassified-heavy traffic mix.
 - Prompt caching on the system prompt + tool schema. ~70% LLM cost reduction.
 - Batch API for non-realtime backfills.
 
-**Ongoing — Data quality**
+**Data quality**
 
 - Per-vendor accuracy evals on a held-out set; CI fails if a prompt change regresses any vendor's accuracy.
 - A/B prompt rollouts behind a feature flag, with shadow comparison against the current prompt.
 - Confidence calibration: do `high`-confidence outputs actually agree with human review at >99%? If not, recalibrate the prompt's confidence guidance.
 
-**Eventually — Schema evolution**
+**Schema evolution**
 
 - Versioned canonical schema. New required field on `shipments`? Add a column, backfill by re-normalizing `raw_events` with the new prompt, blue/green cut traffic over. `raw_events` being immutable + the LLM being deterministic-ish makes this safe.
 
