@@ -71,8 +71,15 @@ const schema = {
       // for non-shipment classifications rather than omitting the key. The
       // cross-field check in validate.js still enforces "if type=shipment
       // then shipment must be a populated object".
+      //
+      // additionalProperties is INTENTIONALLY NOT set to false here. The
+      // universe of vendor-specific identifier fields is unbounded (parcel_id,
+      // tracking_reference, awb, scan_type, driver_id, ...). Rejecting any
+      // extras would route otherwise-correct events to needs_review whenever
+      // the LLM helpfully echoes a vendor field name. Code reads only the
+      // canonical fields below; the full tool_use input is preserved in
+      // raw_events.llm_response for audit.
       type: ['object', 'null'],
-      additionalProperties: false,
       description: 'Required when type = "shipment". Use null otherwise.',
       required: ['natural_key', 'state', 'event_at'],
       properties: {
@@ -114,8 +121,9 @@ const schema = {
 
     invoice: {
       // Nullable for the same reason as `shipment` above.
+      // additionalProperties intentionally NOT false — see the shipment
+      // block comment for rationale.
       type: ['object', 'null'],
-      additionalProperties: false,
       description: 'Required when type = "invoice". Use null otherwise.',
       required: ['natural_key', 'state', 'event_at'],
       properties: {
