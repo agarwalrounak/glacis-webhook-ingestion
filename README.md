@@ -13,116 +13,30 @@ docker compose up --build        # boots MySQL + API + worker
 node scripts/replay-samples.js   # POSTs the 6 sample payloads, prints final state
 ```
 
-The LLM provider is selectable: set `LLM_PROVIDER=anthropic` (default) or `LLM_PROVIDER=openai` in `.env`. The provider abstraction lives in `src/llm/` — the canonical schema is defined once in `normalizeTool.js`, and per-provider adapters in `src/llm/providers/` wrap it in each vendor's tool-calling shape. Nothing outside `src/llm/` knows or cares which provider is in use.
-
-The replay harness:
-
-1. POSTs all 6 sample payloads **concurrently** (vendors don't politely serialize).
-2. POSTs payload #1 a **second time** to demonstrate dedupe.
-3. Waits for the worker to drain.
-4. Prints the materialized `shipments` and `invoices` tables plus their full event history, and runs three sanity checks (Maersk shipment advances to `IN_TRANSIT` despite out-of-order delivery; GFP invoice ends in `PAID` with both events recorded; the marine advisory is routed to `unclassified`).
+Set `LLM_PROVIDER=anthropic` (default) or `LLM_PROVIDER=openai` in `.env` to pick the provider. The replay harness POSTs the sample payloads concurrently, exercises dedupe / out-of-order / unclassified-noise paths, and runs PASS/FAIL sanity checks against the materialized state.
 
 ---
 
 ## Sending a test webhook
 
-The endpoint accepts any well-formed JSON. Useful for poking the system from a terminal, Postman, or a vendor sandbox.
-
-**Single POST — minimum viable:**
+The endpoint accepts any well-formed JSON. The LLM call is async (worker takes ~2–5 s); inspect the result after.
 
 ```bash
+# POST any payload
 curl -sS -X POST http://localhost:3000/webhooks \
   -H 'content-type: application/json' \
-  -d '{
-    "carrier_scac": "MAEU",
-    "transport_doc": { "type": "MBL", "number": "MAEU240498712" },
-    "container": "MSKU7748112",
-    "milestone": "Loaded onboard and sailed",
-    "milestone_at": "2026-04-21T22:47:00+08:00"
-  }' | jq
+  -d '{ "carrier_scac": "MAEU", "container": "MSKU7748112",
+        "milestone": "Loaded onboard and sailed",
+        "milestone_at": "2026-04-21T22:47:00+08:00" }'
+# → { "ok": true, "raw_event_id": 1 }   (returns in <100ms)
+
+# Inspect after the worker runs
+curl -sS http://localhost:3000/raw-events | jq '.[] | {id, status, classification}'
+curl -sS http://localhost:3000/shipments  | jq
+curl -sS http://localhost:3000/invoices   | jq
 ```
 
-Response (immediate, < 100 ms):
-
-```json
-{ "ok": true, "raw_event_id": 1 }
-```
-
-The LLM call happens asynchronously in the worker (~2–5 s later). Watch `docker compose logs -f app` to see it process, then inspect the result:
-
-```bash
-curl -sS http://localhost:3000/raw-events  | jq '.[] | {id, status, classification, attempts}'
-curl -sS http://localhost:3000/shipments   | jq
-curl -sS http://localhost:3000/invoices    | jq
-```
-
-**Tag with a vendor name** (lands in `raw_events.vendor_hint`):
-
-```bash
-curl -sS -X POST http://localhost:3000/webhooks/lastmilenow \
-  -H 'content-type: application/json' \
-  -d '{ "system": "LastMileNow API", "tracking_reference": "LMN-99999",
-        "update": { "description": "On the truck" },
-        "timestamp_utc": "2026-05-24T12:15:00Z" }'
-```
-
-**Demonstrate dedupe** (identical bodies):
-
-```bash
-PAYLOAD='{"carrier":"DHL","awb":"123-99999","milestone":"departed","event_time":"2026-05-24T10:00:00Z"}'
-
-curl -sS -X POST http://localhost:3000/webhooks \
-  -H 'content-type: application/json' -d "$PAYLOAD" | jq
-# → { "ok": true, "raw_event_id": 2 }
-
-curl -sS -X POST http://localhost:3000/webhooks \
-  -H 'content-type: application/json' -d "$PAYLOAD" | jq
-# → { "ok": true, "duplicate": true, "raw_event_id": 2, "status": "..." }
-```
-
-**Demonstrate out-of-order** (same entity, two events, "wrong" order):
-
-```bash
-# DELIVERED arrives first
-curl -sS -X POST http://localhost:3000/webhooks -H 'content-type: application/json' -d '{
-  "logistics_provider": "TestCarrier", "parcel_id": "TEST-001",
-  "scan_type": "Handed to recipient", "scan_time": "2026-05-25T14:45:00Z"
-}'
-
-sleep 5
-
-# Then PICKED_UP (chronologically earlier)
-curl -sS -X POST http://localhost:3000/webhooks -H 'content-type: application/json' -d '{
-  "logistics_provider": "TestCarrier", "parcel_id": "TEST-001",
-  "scan_type": "Collected from sender", "scan_time": "2026-05-23T10:15:00Z"
-}'
-
-sleep 5
-
-# current_state should be DELIVERED; history should have BOTH events.
-curl -sS http://localhost:3000/shipments | jq '.[] | select(.natural_key | contains("test-001"))'
-```
-
-**Unhappy paths:**
-
-```bash
-# Malformed JSON → 400 malformed_json
-curl -i -X POST http://localhost:3000/webhooks \
-  -H 'content-type: application/json' -d '{ this is not json'
-
-# Payload > 256 KiB → 413 payload_too_large
-python3 -c "import json,sys; sys.stdout.write(json.dumps({'data':'x'*300000}))" \
-  | curl -i -X POST http://localhost:3000/webhooks \
-      -H 'content-type: application/json' --data-binary @-
-```
-
-**Query MySQL directly** (for debugging):
-
-```bash
-docker compose exec mysql mysql -uroot -proot glacis -e "
-  SELECT id, status, classification, attempts, entity_type, entity_id, llm_latency_ms
-    FROM raw_events ORDER BY id DESC LIMIT 5;"
-```
+For end-to-end behavior — dedupe, out-of-order, unclassified noise, the full sanity-check suite — use `node scripts/replay-samples.js` instead of hand-rolling curls.
 
 ---
 
@@ -284,13 +198,9 @@ These are the calls I made knowingly and would revisit for production:
 
 5. **Single LLM call per event.** No two-stage classify-then-extract, no model triage (cheap classifier → expensive extractor). For these payloads a single Sonnet call is accurate enough. At scale, the cost-optimal path is Haiku classification → Sonnet extraction only for shipments/invoices.
 
-6. **No prompt caching.** The Anthropic prompt-caching feature would cache the system prompt + tool schema (~2 KB of stable prefix), cutting per-call cost ~70%. Single-line change — not done because it complicates explaining the bare path.
+6. **No observability tooling.** Structured logs via pino, but no metrics, no traces, no alerting. In production this is a Prometheus + OTel job: `raw_events.status` counters, claim-to-settle latency histograms, LLM latency/cost per call, queue depth alarms.
 
-7. **Confidence-based human review, no UI.** Low-confidence and schema-invalid results land in `raw_events` with `status='needs_review'` but there's no UI to act on them. The data is there; the review surface isn't.
-
-8. **No observability tooling.** Structured logs via pino, but no metrics, no traces, no alerting. In production this is a Prometheus + OTel job: `raw_events.status` counters, claim-to-settle latency histograms, LLM latency/cost per call, queue depth alarms.
-
-9. **Invoice state transitions enforced by rank only.** "Don't regress" is enforced, but stricter transition rules (e.g. REFUNDED only valid after PAID; VOIDED only from ISSUED) are *not* enforced as hard constraints — they're documented in `src/domain/states.js`. The history is the source of truth; the materialized `current_state` is a convenience. Sufficient for the assessment; in production I'd add a transition map.
+7. **Invoice state transitions enforced by rank only.** "Don't regress" is enforced, but stricter transition rules (e.g. REFUNDED only valid after PAID; VOIDED only from ISSUED) are *not* enforced as hard constraints — they're documented in `src/domain/states.js`. The history is the source of truth; the materialized `current_state` is a convenience. Sufficient for the assessment; in production I'd add a transition map.
 
 ---
 
@@ -370,25 +280,17 @@ In rough priority order — what I'd do next to take this to production:
 
 ---
 
-## Failure modes catalog (for the record)
+## Failure modes catalog
 
-A non-exhaustive list of failure modes the design defends against:
+Beyond what's covered in "How the hard problems are solved" above, a quick reference for the system's defenses:
 
 | Failure | Defense |
 | --- | --- |
-| Vendor retries identical payload | `body_hash UNIQUE` on `raw_events`; second POST returns 200 immediately |
-| Vendor retries with whitespace differences | New `raw_events` row, but entity-layer `UNIQUE(entity_id, raw_event_id)` prevents duplicate state changes (event lands in history as a non-advancing event) |
-| Events arrive out of order | Strict-rank advance on `current_state`; history always appends |
-| Two events for same entity processed concurrently | `SELECT FOR UPDATE` row lock inside the settle transaction serializes them |
-| Worker crashes mid-LLM-call | Row stays at `status='processing'`. The claim query picks up `processing` rows with expired `locked_until` (alongside normal `pending` work) — a single primitive handles both new work and dead-worker recovery. LLM call wasted, correctness preserved. |
-| Worker crashes between LLM and settle | Same as above — settle transaction never committed, row eventually re-claimed via lease expiry |
-| LLM returns malformed tool input | AJV validation fails → `needs_review` (don't retry; this is a model bug) |
-| LLM returns ambiguous classification | `confidence: 'low'` → `needs_review` |
-| LLM is down / rate limited | Exponential backoff with jitter; after N attempts → `dead` (DLQ) |
+| Vendor retries identical payload | `body_hash UNIQUE`; second POST returns 200 immediately with no LLM cost |
+| Events arrive out of order | Strict-rank advance on `current_state`; history always appends in arrival order |
 | DB is down at ingest | API returns 500 → vendor retries → eventually succeeds with same `body_hash` |
 | DB transient failure during settle | Transaction rolls back; row reverts to `pending` with backoff |
-| Vendor sends malformed JSON | API returns 400 with parse error message; no `raw_event` row created |
+| Vendor sends malformed JSON | API returns 400 with parse error; no `raw_event` row created |
 | Vendor sends huge payload | API returns 413 (`MAX_BODY_BYTES`); protects LLM token budget |
-| Prompt/schema bug causes wrong outputs | Fix prompt, mass `UPDATE raw_events SET status='pending'`, worker re-processes |
-| New vendor with novel payload | Zero code change; if accuracy is bad, add examples to system prompt |
-| Same entity referenced by two different vendors | LLM composes `natural_key` deterministically; if both vendors share identifiers (SCAC + BL), they collide cleanly; if not, they're separate records and a downstream entity-resolution job links them |
+| Prompt/schema bug caused wrong outputs in production | Fix prompt, mass `UPDATE raw_events SET status='pending'`, worker re-processes — replay is a SQL statement |
+| Same entity from two different vendors | LLM composes `natural_key` deterministically; if vendors share identifiers (SCAC + BL), they collide cleanly. Otherwise: separate records, downstream entity-resolution job links them |
