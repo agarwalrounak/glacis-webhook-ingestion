@@ -1,0 +1,102 @@
+'use strict';
+
+// The 6 sample payloads from the assessment, verbatim. The ordering of this
+// array is intentionally NOT chronological — the Maersk IN_TRANSIT event
+// (apr-21) appears before its PICKED_UP precursor (apr-19), and the
+// GlobalFreightPay PAID event arrives before the ISSUED event. The replay
+// script POSTs them in this order to exercise the out-of-order safety logic.
+module.exports = [
+  {
+    label: '1) Maersk vessel departed (IN_TRANSIT) — arrives before PICKED_UP',
+    body: {
+      carrier_scac: 'MAEU',
+      event_msg_id: 'MAEU-EVT-2026-04-22-0001',
+      transport_doc: { type: 'MBL', number: 'MAEU240498712' },
+      container: 'MSKU7748112',
+      vessel: { name: 'MAERSK GUATEMALA', imo: '9778120', voyage: '424W' },
+      milestone: 'Loaded onboard and sailed',
+      milestone_at: '2026-04-21T22:47:00+08:00',
+      port: { code: 'CNSHA', name: 'Shanghai' },
+    },
+  },
+  {
+    label: '2) Maersk gate-in at origin (PICKED_UP) — out-of-order precursor',
+    body: {
+      carrier_scac: 'MAEU',
+      event_msg_id: 'MAEU-EVT-2026-04-19-0042',
+      transport_doc: { type: 'MBL', number: 'MAEU240498712' },
+      container: 'MSKU7748112',
+      milestone: 'Empty container released to shipper; full container received at origin terminal',
+      milestone_at: '2026-04-19T11:15:00+08:00',
+      port: { code: 'CNSHA', name: 'Shanghai' },
+      shipper_ref: 'ACME-IND-PO-2026-9921',
+    },
+  },
+  {
+    label: '3) GlobalFreightPay settled (PAID) — arrives before ISSUED',
+    body: {
+      source: 'globalfreightpay.api',
+      channel: 'carrier_billing',
+      doc_ref: 'GFP-INV-2026-Q2-08821',
+      carrier: 'Hapag-Lloyd AG',
+      linked_bl: 'HLCU2604OCEAN221',
+      transaction: {
+        kind: 'settled in full',
+        settled_at: '2026-04-22 18:47:11+02:00',
+        amount: 'EUR 24.350,75',
+        remitter: 'ACME Logistics GmbH',
+        memo: 'Ocean freight + THC + BAF, Shanghai → Hamburg, container HLBU4490221',
+      },
+    },
+  },
+  {
+    label: '4) GlobalFreightPay raised (ISSUED) — out-of-order precursor',
+    body: {
+      source: 'globalfreightpay.api',
+      channel: 'carrier_billing',
+      doc_ref: 'GFP-INV-2026-Q2-08821',
+      carrier: 'Hapag-Lloyd AG',
+      linked_bl: 'HLCU2604OCEAN221',
+      transaction: {
+        kind: 'freight invoice raised',
+        issued_at: '2026-04-15T09:00:00+02:00',
+        amount: 'EUR 24.350,75',
+        due_at: '2026-05-15T00:00:00+02:00',
+        line_items: [
+          { desc: 'Ocean freight Shanghai → Hamburg', amt: 'EUR 21.000,00' },
+          { desc: 'Terminal handling charges (THC)', amt: 'EUR 1.850,75' },
+          { desc: 'Bunker adjustment factor (BAF)', amt: 'EUR 1.500,00' },
+        ],
+      },
+    },
+  },
+  {
+    label: '5) Ocean Network Express released to consignee (DELIVERED)',
+    body: {
+      carrier: 'Ocean Network Express',
+      carrier_scac: 'ONEY',
+      event_id: 'ONE-2026-04-28-114',
+      house_bl: 'ONEYJKTHKG2604113',
+      master_bl: 'ONEYMBLHKG260499',
+      container_no: 'TLLU2890442',
+      consignee: 'ACME Manufacturing PT.',
+      milestone_text: 'Cargo released to consignee at consignee facility — empty container returned to depot',
+      milestone_local_time: '28/04/2026 09:42 WIB',
+      port_of_discharge: 'IDJKT',
+      delivery_order_no: 'DO-IDJKT-26044881',
+    },
+  },
+  {
+    label: '6) Marine traffic advisory (UNCLASSIFIED)',
+    body: {
+      issuer: 'marine-traffic-advisory',
+      advisory_id: 'MTA-2026-04-26-EU-007',
+      severity: 'AMBER',
+      issued_at: '2026-04-26T06:00:00Z',
+      subject: 'Ongoing congestion at Port of Antwerp-Bruges',
+      body: 'Vessel waiting times at Antwerp-Bruges berths have increased to 4-6 days due to labour action by terminal operators. Carriers are advised to consider rerouting via Rotterdam or Zeebrugge. ETAs across all services calling at Antwerp-Bruges should be assumed delayed until further notice.',
+      affected_services: ['AE7', 'FAL3', 'Mediterranean Bridge'],
+      expires_at: '2026-05-03T00:00:00Z',
+    },
+  },
+];
